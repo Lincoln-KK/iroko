@@ -5,18 +5,28 @@ import ctypes
 import logging
 from multiprocessing import RawArray, RawValue
 import numpy as np
-from gym import Env as openAIGym, spaces
+from gymnasium import Env as openAIGym, spaces
+# from gym import Env as openAIGym, spaces
 
-import dc_gym.utils as dc_utils
-from dc_gym.control.iroko_bw_control import BandwidthController
-from dc_gym.iroko_sampler import StatsSampler
-from dc_gym.iroko_traffic import TrafficGen
-from dc_gym.iroko_state import StateManager
-from dc_gym.utils import TopoFactory
-from dc_gym.topos.network_manager import NetworkManager
+#import dc_gym.utils as dc_utils
+import utils as dc_utils
+#from dc_gym.control.iroko_bw_control import BandwidthController
+from control.iroko_bw_control import BandwidthController
+#from dc_gym.iroko_sampler import StatsSampler
+from iroko_sampler import StatsSampler
+#from dc_gym.iroko_traffic import TrafficGen
+from iroko_traffic import TrafficGen
+#from dc_gym.iroko_state import StateManager
+from iroko_state import StateManager
+#from dc_gym.utils import TopoFactory
+from utils import TopoFactory
+#from dc_gym.topos.network_manager import NetworkManager
+from topos.network_manager import NetworkManager
+
+from logger import get_logger
+log = get_logger(__name__)
 
 
-log = logging.getLogger(__name__)
 FILE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 DEFAULT_CONF = {
@@ -51,7 +61,7 @@ DEFAULT_CONF = {
     # Specifies which variables represent the state of the environment:
     # Eligible variables:
     # "action", "queue","std_dev", "joint_queue", "fair_queue"
-    "reward_model": ["step"],
+    "reward_model": ["joint_queue"], # Default was ["step"]. Also ["fair_queue"]
 }
 
 
@@ -109,7 +119,8 @@ class DCEnv(openAIGym):
         # Set the active traffic matrix
         self._set_traffic_matrix(
             self.conf["tf_index"], self.conf["input_dir"], self.topo)
-
+        # Default sets self.input_file to "incast_2" for dumbbell & "stag_prob_0_2_3_data" for fat-tree 
+        
         # each unique id has its own sub folder
         if self.conf["parallel_envs"]:
             self.conf["output_dir"] += f"/{self.short_id}"
@@ -136,18 +147,18 @@ class DCEnv(openAIGym):
         self.tx_rate = dc_utils.shmem_to_nparray(tx_rate, np.float32)
         active_rate = RawArray(ctypes.c_uint32, num_actions)
         self.active_rate = dc_utils.shmem_to_nparray(active_rate, np.float32)
-        log.info("%s Setting action space", (self.short_id))
-        log.info("from %s", action_min)
-        log.info("to %s", action_max)
-
+        # log.info("%s Setting action space", (self.short_id))
+        # log.info("from %s", action_min)
+        # log.info("to %s", action_max)
+        log.debug(f"{self.short_id} Setting action space from {action_min} to {action_max}")
         # set the observation space
         num_ports = self.topo.get_num_sw_ports()
         num_features = len(self.conf["state_model"])
         if self.conf["collect_flows"]:
             num_features += num_actions * 2
-        obs_min = np.empty(num_ports * num_features + num_actions)
+        obs_min = np.empty(num_ports * num_features) # + num_actions) # Omitted to remove active rate from observation
         obs_min.fill(-np.inf)
-        obs_max = np.empty(num_ports * num_features + num_actions)
+        obs_max = np.empty(num_ports * num_features) # + num_actions)
         obs_max.fill(np.inf)
         self.observation_space = spaces.Box(
             low=obs_min, high=obs_max, dtype=np.float64)
@@ -159,12 +170,12 @@ class DCEnv(openAIGym):
     def _start_managers(self):
         # actually generate a topology if it does not exist yet
         if not self.net_man:
-            log.info("%s Starting network manager...", self.short_id)
+            log.debug("%s Starting network manager...", self.short_id)
             self.net_man = NetworkManager(self.topo,
                                           self.conf["agent"].lower())
         # in a similar way start a traffic generator
         if not self.traffic_gen:
-            log.info("%s Starting traffic generator...", self.short_id)
+            log.debug("%s Starting traffic generator...", self.short_id)
             self.traffic_gen = TrafficGen(self.net_man,
                                           self.conf["transport"],
                                           self.conf["output_dir"])
@@ -187,7 +198,7 @@ class DCEnv(openAIGym):
             self.bw_ctrl.start()
 
     def _start_env(self):
-        log.info("%s Starting environment...", self.short_id)
+        log.debug("%s Starting environment...", self.short_id)
         # Launch all managers (if they are not active already)
         # This lazy initialization ensures that the environment object can be
         # created without initializing the virtual network
@@ -196,61 +207,158 @@ class DCEnv(openAIGym):
         self.traffic_gen.start(self.input_file)
 
     def _stop_env(self):
-        log.info("%s Stopping environment...", self.short_id)
+        log.debug("%s Stopping environment...", self.short_id)
         if self.traffic_gen:
-            log.info("%s Stopping traffic", self.short_id)
+            log.debug("%s Stopping traffic", self.short_id)
             self.traffic_gen.stop()
-        log.info("%s Done with stopping.", self.short_id)
+        log.debug("%s Done with stopping.", self.short_id)
 
-    def reset(self):
+    def reset(self, *, seed=None, options=None):
+        if self.state_man:
+           log.info(f"Resetting environment {self.short_id}, observation {self.state_man.observe()}")
         self._stop_env()
         self._start_env()
-        log.info("%s Done with resetting.", self.short_id)
-        return np.zeros(self.observation_space.shape)
+        log.debug("%s Done with resetting.", self.short_id)
+        return np.zeros(self.observation_space.shape), {}
 
     def close(self):
         if self.terminated:
             return
         self.terminated = True
-        log.info("%s Closing environment...", self.short_id)
+        log.debug("%s Closing environment...", self.short_id)
         if self.state_man:
-            log.info("%s Stopping all state collectors...", self.short_id)
+            log.debug("%s Stopping all state collectors...", self.short_id)
             self.state_man.close()
             self.state_man = None
         if self.bw_ctrl:
-            log.info("%s Shutting down bandwidth control...", self.short_id)
+            log.debug("%s Shutting down bandwidth control...", self.short_id)
             self.bw_ctrl.close()
             self.bw_ctrl = None
         if self.sampler:
-            log.info("%s Shutting down data sampling.", self.short_id)
+            log.debug("%s Shutting down data sampling.", self.short_id)
             self.sampler.close()
             self.sampler = None
         if self.traffic_gen:
-            log.info("%s Shutting down generators...", self.short_id)
+            log.debug("%s Shutting down generators...", self.short_id)
             self.traffic_gen.close()
             self.traffic_gen = None
         if self.net_man:
-            log.info("%s Stopping network.", self.short_id)
+            log.debug("%s Stopping network.", self.short_id)
             self.net_man.stop_network()
             self.net_man = None
-        log.info("%s Done with destroying myself.", self.short_id)
+        log.debug("%s Done with destroying myself.", self.short_id)
 
     def step(self, action):
         # Truncate actions to legal values
         action = np.clip(action, self.action_space.low, self.action_space.high)
         # Retrieve observation and reward
         obs = self.state_man.observe()
+        obs = np.array(obs)
         self.reward.value = self.state_man.get_reward(action)
         # Retrieve the bandwidth enforced by bandwidth control
-        obs.extend(self.active_rate)
+        # obs = np.append(obs, self.active_rate)
+        # FIX: Move the active rate to info dict so that it is not part of the observation
+        info = {}
+        info["active_rate"] = self.active_rate
+        info["action"] = action # Monitor the action taken & compare with active rate
+        
         # Update the array with the bandwidth control
         self.tx_rate[:] = action
         # The environment is finished when the traffic generators have stopped
-        done = not self.traffic_gen.check_if_traffic_alive()
-        return obs, self.reward.value, done, {}
+        terminated = done = not self.traffic_gen.check_if_traffic_alive()
+        truncated = False
+        return obs, self.reward.value, done, truncated, info
 
     def _handle_interrupt(self, signum, frame):
         log.warning("%s \nEnvironment: Caught interrupt", self.short_id)
         atexit.unregister(self.close())
         self.close()
         sys.exit(1)
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--output_dir", default="results/EnvRun2")
+    parser.add_argument("--topo", default="dumbbell")
+    parser.add_argument("--state_model", default=["backlog"], nargs="+", help="State model (backlog, drops, olimit, bw_rx, bw_tx)")
+    parser.add_argument("--reward_model", default=["joint_queue"], nargs="+", help="Reward model (step, std_dev, joint_queue, fair_queue)")
+    args = parser.parse_args()
+    env = DCEnv(vars(args))
+    # env = DCEnv({"output_dir": "results/EnvRun2"})
+    print(f"Env config: {env.conf}")
+    print("Running environment test from main")
+
+    STEPS = 10
+    env.reset()
+    
+    #Use stable_baselines3 environment check
+    from stable_baselines3.common.env_checker import check_env
+    import time
+    print("Checking environment using stable_baselines3")
+    check_env(env, warn=True, skip_render_check=True)
+    print("Done checking environment")
+    bw = []
+    done = False
+    # Set the precision of the array to 2 decimal places
+    # np.set_printoptions(precision=2)
+    print(f"Running environment for {STEPS} steps - Random actions")
+    for i in range(STEPS):
+        action = env.action_space.sample()
+        obs, reward, terminated, truncated, info = env.step(action)
+        wait = 0.1
+        time.sleep(wait)
+        
+        if env.conf["collect_flows"]:
+            pass
+            # Format observation to be more readable
+        done = terminated or truncated
+        print(f"{i+1}. Action: {action}\n Obs: {obs} <- {len(obs)=} \nReward: {reward}, Done: {done}")
+        # print(f"Active rate: {info['active_rate']} \nTx rate:    {info['action']}")
+        if np.allclose(info['active_rate'], info['action']):
+            print("Active rate == Tx rate")
+        else:
+            print("Active rate != Tx rate")
+        print("\n")
+
+    env.reset()
+    done = False
+    print(f"Running environment for {STEPS} steps - MAX actions")
+    for i in range(STEPS):
+        action = env.action_space.high
+        obs, reward, terminated, truncated, info = env.step(action)
+        wait = 0.1
+        time.sleep(wait)
+        
+        if env.conf["collect_flows"]:
+            pass
+            # Format observation to be more readable
+        done = terminated or truncated
+        print(f"{i+1}. Action: {action}\n Obs: {obs} <- {len(obs)=} \nReward: {reward}, Done: {done}")
+        # print(f"Active rate: {info['active_rate']} \nTx rate:    {info['action']}")
+        if np.allclose(info['active_rate'], info['action']):
+            print("Active rate == Tx rate")
+        else:
+            print("Active rate != Tx rate")
+        print("\n")
+
+    env.reset()
+    done = False
+    print(f"Running environment for {STEPS} steps - MIN actions")
+    for i in range(STEPS):
+        action = env.action_space.low
+        obs, reward, terminated, truncated, info = env.step(action)
+        wait = 0.1
+        time.sleep(wait)
+        
+        if env.conf["collect_flows"]:
+            pass
+            # Format observation to be more readable
+        done = terminated or truncated
+        print(f"{i+1}. Action: {action}\n Obs: {obs} <- {len(obs)=} \nReward: {reward}, Done: {done}")
+        # print(f"Active rate: {info['active_rate']} \nTx rate:    {info['action']}")
+        if np.allclose(info['active_rate'], info['action']):
+            print("Active rate == Tx rate")
+        else:
+            print("Active rate != Tx rate")
+        print("\n")
+    env.close()
